@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ settings.app_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v=20260418g">
+</head>
+<body data-llm-ready="{{ 'true' if settings.is_llm_configured else 'false' }}">
+    <div class="page-glow"></div>
+    <div class="page-grain"></div>
+
+    <main class="app-shell">
+        <section class="main-panel">
+            <header class="workspace-header">
+                <div>
+                    <p class="workspace-eyebrow">Resume Optimizer</p>
+                    <h1>简历优化工作台</h1>
+                </div>
+                <div id="status-pill" class="status-pill">
+                    <span class="status-dot"></span>
+                    <span id="status-text">待命中</span>
+                </div>
+            </header>
+
+            {% if error %}
+            <div class="server-error">{{ error }}</div>
+            {% endif %}
+
+            <div id="stage-feed" class="stage-feed">
+                <section id="empty-state" class="empty-state">
+                    <p class="workspace-eyebrow">开始一次优化</p>
+                    <h2>输入简历与 JD，执行过程会在这里按阶段展开。</h2>
+                    <p>左侧只保留执行过程，最终结果不再预览正文，而是通过右侧结果栏下载 Markdown 简历。</p>
+                </section>
+            </div>
+
+            <form id="composer" class="composer" autocomplete="off">
+                <div class="composer-toolbar">
+                    <button type="button" class="ghost-tool" data-open-modal="upload-modal">上传简历</button>
+                    <button type="button" class="ghost-tool" data-open-modal="resume-modal">粘贴简历</button>
+                    <button type="button" class="ghost-tool" data-open-modal="jd-modal">JD 信息</button>
+                </div>
+
+                <div class="composer-row">
+                    <input
+                        id="focus-notes-input"
+                        class="focus-input"
+                        type="text"
+                        value="{{ focus_notes }}"
+                        placeholder="补充信息：例如优先突出 ToB 项目、AI 应用交付结果、业务指标或面试侧重点"
+                    >
+                    <button id="run-button" type="submit" class="primary-button">开始优化</button>
+                </div>
+                <p id="composer-hint" class="composer-hint">
+                    {% if resume_text or job_description %}
+                    已录入部分信息，可继续补充后开始优化。
+                    {% else %}
+                    通过上方按钮录入简历和 JD，补充信息支持直接在输入框填写。
+                    {% endif %}
+                </p>
+            </form>
+        </section>
+
+        <aside class="result-panel">
+            <details id="result-dock" class="result-dock">
+                <summary>
+                    <div>
+                        <p class="workspace-eyebrow">结果栏</p>
+                        <h2>优化简历下载</h2>
+                    </div>
+                    <span id="result-badge" class="dock-badge">待生成</span>
+                </summary>
+                <div class="result-body">
+                    <p id="result-copy">生成完成后，这里会启用 Markdown 下载按钮。</p>
+                    <a id="download-md" class="download-button disabled" href="#" aria-disabled="true">下载 Markdown</a>
+                </div>
+            </details>
+        </aside>
+    </main>
+
+    <div id="modal-host" class="modal-host" hidden>
+        <div class="modal-scrim" data-close-modal></div>
+
+        <section id="upload-modal" class="input-modal" hidden aria-modal="true" role="dialog" aria-labelledby="upload-modal-title">
+            <div class="modal-card">
+                <div class="modal-header">
+                    <div>
+                        <p class="workspace-eyebrow">上传简历</p>
+                        <h3 id="upload-modal-title">选择 TXT / MD / PDF 文件</h3>
+                    </div>
+                    <button type="button" class="modal-close" data-close-modal>关闭</button>
+                </div>
+                <input id="modal-resume-file" type="file" accept=".txt,.md,.pdf">
+                <p id="upload-hint" class="modal-hint">未选择文件</p>
+                <div class="modal-actions">
+                    <button type="button" class="ghost-tool" data-close-modal>取消</button>
+                    <button type="button" class="primary-button modal-save" id="save-upload">保存</button>
+                </div>
+            </div>
+        </section>
+
+        <section id="resume-modal" class="input-modal" hidden aria-modal="true" role="dialog" aria-labelledby="resume-modal-title">
+            <div class="modal-card">
+                <div class="modal-header">
+                    <div>
+                        <p class="workspace-eyebrow">粘贴简历</p>
+                        <h3 id="resume-modal-title">填写简历文本</h3>
+                    </div>
+                    <button type="button" class="modal-close" data-close-modal>关闭</button>
+                </div>
+                <textarea id="modal-resume-text" rows="14" placeholder="在这里粘贴简历全文...">{{ resume_text }}</textarea>
+                <div class="modal-actions">
+                    <button type="button" class="ghost-tool" data-close-modal>取消</button>
+                    <button type="button" class="primary-button modal-save" id="save-resume">保存</button>
+                </div>
+            </div>
+        </section>
+
+        <section id="jd-modal" class="input-modal" hidden aria-modal="true" role="dialog" aria-labelledby="jd-modal-title">
+            <div class="modal-card">
+                <div class="modal-header">
+                    <div>
+                        <p class="workspace-eyebrow">JD 信息</p>
+                        <h3 id="jd-modal-title">填写目标职位描述</h3>
+                    </div>
+                    <button type="button" class="modal-close" data-close-modal>关闭</button>
+                </div>
+                <textarea id="modal-jd-text" rows="14" placeholder="粘贴岗位职责、任职要求、关键词...">{{ job_description }}</textarea>
+                <div class="modal-actions">
+                    <button type="button" class="ghost-tool" data-close-modal>取消</button>
+                    <button type="button" class="primary-button modal-save" id="save-jd">保存</button>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="{{ url_for('static', path='/app.js') }}?v=20260418g"></script>
+</body>
+</html>
