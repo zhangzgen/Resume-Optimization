@@ -1,63 +1,68 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
-from app.llm import DeepSeekClient
+from app.llm import MiMoClient, extract_json_object
 from app.models import AnalysisResult, OptimizationResult, normalize_bullets
 
-ANALYSIS_SYSTEM_PROMPT = """
+SCORE_SYSTEM_PROMPT = """
 # Role: 资深HRBP与金牌猎头顾问
 
-## Profile
-- **背景:** 拥有10年以上跨行业招聘经验，阅历过数以万计的简历。
-- **专长:** 深刻理解用人部门（Hiring Manager）在JD背后隐藏的真实诉求；精通候选人背景包装、能力提取与职业规划。
-- **风格:** 既具备HR的严谨客观，又拥有猎头的敏锐。专业、毒舌但极具建设性，能够一针见血地指出简历的致命伤，并提供“化腐朽为神奇”的实操修改建议。
+你的任务是快速评估候选人简历与目标JD的匹配度，**仅输出 JSON**，不要输出其他内容。
 
-## Task
-你的任务是深度分析候选人提供的【简历】与【目标JD】的匹配度，并严格按照指定的 Markdown 格式，输出一份专业的简历诊断与优化报告。
+## Output Format (严格输出 JSON)
 
-## Guidelines (执行原则)
-1. **深度语义理解，拒绝死板匹配：** 不要只做简单的“关键词匹配”。要能识别出经历与要求之间的内在联系。
-2. **客观量化评分：** 综合考量硬性条件与软性经验，给出一个客观的综合匹配度得分（百分制）。
-3. **区分缺口类型：** 准确识别出是“硬性不匹配”还是“表达性不匹配”。
-4. **提供保姆级修改示范：** 优化建议必须可落地。运用 STAR 法则，直接给出“修改前 vs 修改后”的文案对比。
-5. **解码行业黑话：** 确保分析和建议符合目标行业的专业调性，指导候选人使用正确的行业术语。
+{
+  "score": 85,
+  "summary": "一句话概括匹配情况"
+}
+""".strip()
 
-## Output Format (输出格式要求)
-请**务必使用 Markdown 格式**输出最终报告，并严格套用以下排版结构（直接输出报告内容，不要包含任何多余的寒暄）：
+ANALYSIS_SYSTEM_PROMPT = """
+你是一名资深HRBP与猎头顾问，拥有10年以上跨行业招聘经验。请深度分析候选人简历与目标JD，输出一份专业的简历诊断报告。
 
-# 📊 简历与JD匹配度诊断报告
+## 核心原则
+1. **深度语义匹配**：识别经历与要求的内在联系，不做简单关键词匹配
+2. **区分缺口类型**：区分"硬性不匹配"和"表达性不匹配"
+3. **基于真实内容**：所有建议严格基于简历已有内容，禁止编造未提及的数字、项目或成果
+4. **专业表达**：使用目标行业的专业术语
 
-## 🎯 综合匹配度评分：[XX]%
-*(综合考量硬性门槛与软性经验给出的客观得分)*
-- **🟢 优势项加分**：[简述拉高评分的核心原因]
-- **🔴 劣势项减分**：[简述拉低评分的核心原因]
-- **💡 猎头研判**：[给出总体结论]
+## 输出格式（严格遵守，直接输出报告，不要寒暄）
 
-## 🌟 一、 匹配亮点 (Highlights)
-- **[提炼核心优势1]**：[具体说明及对应简历中的证据]
-- **[提炼核心优势2]**：[具体说明及对应简历中的证据]
-- **[提炼核心优势3]**：[具体说明及对应简历中的证据]
+# 📊 详细匹配分析
 
-## ⚠️ 二、 主要缺口 (Gaps)
-- **🧱 硬性缺口**：[若无则写“无明显硬性缺口”]
-- **📝 表达缺口**：[指出简历中未写透、未量化、未使用行业术语的地方]
+## 🌟 一、匹配亮点
 
-## 🛠️ 三、 具体优化建议 (Actionable Advice)
+- **[核心优势1]**：具体说明及简历中的对应证据
+- **[核心优势2]**：具体说明及简历中的对应证据
+- **[核心优势3]**：具体说明及简历中的对应证据
 
-### 1. 整体策略建议
-- [关于排版、模块侧重、冗余信息删减的宏观建议]
+## ⚠️ 二、主要缺口
 
-### 2. 核心经历话术重构 (Before vs After)
-至少提供 2 个核心经历的重写，必须包含：
-- 原句
-- 修改后文案
-- 优化逻辑
+- **硬性缺口**：[若无则写"无明显硬性缺口"]
+- **表达缺口**：[指出简历中未写透、未量化、未使用行业术语的地方]
 
-## 💡 四、 猎头私房话：面试策略提示
-- **人设定位**：[一句话总结候选人在面试中应该主打什么样的人设]
-- **高频追问预警**：[指出面试官大概率会针对简历中的哪个薄弱点进行深挖，并给出应对思路]
+## 🛠️ 三、优化建议
+
+### 整体策略
+- 关于排版、模块侧重、冗余信息删减的宏观建议
+
+### 表达优化
+针对简历中已有真实经历，指出可强化的表达方向，但不要编造未提及的内容。
+
+## 💡 四、面试策略
+
+- **人设定位**：一句话总结候选人面试中应主打的人设
+- **高频追问预警**：面试官可能针对简历薄弱点的深挖方向及应对思路
+
+## 📋 五、匹配度总结
+
+| 维度 | 评分 | 说明 |
+|------|------|------|
+| 技能匹配 | X/10 | 简要说明 |
+| 经验匹配 | X/10 | 简要说明 |
+| 综合匹配 | X/10 | 简要说明 |
 """.strip()
 
 OPTIMIZATION_SYSTEM_PROMPT = """
@@ -77,17 +82,8 @@ OPTIMIZATION_SYSTEM_PROMPT = """
 """.strip()
 
 
-class ResumeOptimizerAgent:
-    def __init__(self, llm_client: Optional[DeepSeekClient] = None) -> None:
-        self.llm_client = llm_client or DeepSeekClient()
-
-    async def analyze(
-        self,
-        resume_text: str,
-        job_description: str,
-        focus_notes: str = "",
-    ) -> AnalysisResult:
-        prompt = f"""
+def _score_prompt(resume_text: str, job_description: str, focus_notes: str = "") -> str:
+    return f"""
 ## Input (输入信息)
 
 **【目标职位 JD】**
@@ -99,8 +95,83 @@ class ResumeOptimizerAgent:
 **【补充信息】**
 {focus_notes or "无"}
 """.strip()
-        report_markdown = await self.llm_client.complete_text(ANALYSIS_SYSTEM_PROMPT, prompt, temperature=0.15)
+
+
+def _analysis_prompt(resume_text: str, job_description: str, focus_notes: str = "") -> str:
+    return f"""
+## Input (输入信息)
+
+**【目标职位 JD】**
+{job_description}
+
+**【候选人简历】**
+{resume_text}
+
+**【补充信息】**
+{focus_notes or "无"}
+""".strip()
+
+
+class ResumeOptimizerAgent:
+    def __init__(self, llm_client: Optional[MiMoClient] = None) -> None:
+        self.llm_client = llm_client or MiMoClient()
+
+    async def score_only(
+        self,
+        resume_text: str,
+        job_description: str,
+        focus_notes: str = "",
+    ) -> dict[str, Any]:
+        """Quick match score, returns JSON."""
+        text = await self.llm_client.complete_text(
+            SCORE_SYSTEM_PROMPT, _score_prompt(resume_text, job_description, focus_notes), temperature=0,
+        )
+        return extract_json_object(text)
+
+    async def stream_score(
+        self,
+        resume_text: str,
+        job_description: str,
+        focus_notes: str = "",
+    ) -> AsyncIterator[str]:
+        """Stream score generation. Yields text chunks, final yield is the parsed JSON dict."""
+        full_text = ""
+        async for chunk in self.llm_client.stream_text(
+            SCORE_SYSTEM_PROMPT, _score_prompt(resume_text, job_description, focus_notes), temperature=0,
+        ):
+            full_text += chunk
+            yield chunk
+        try:
+            yield extract_json_object(full_text)
+        except Exception:
+            yield {"score": 0, "summary": "匹配度解析失败"}
+
+    async def analyze(
+        self,
+        resume_text: str,
+        job_description: str,
+        focus_notes: str = "",
+    ) -> AnalysisResult:
+        """Detailed analysis without match score."""
+        report_markdown = await self.llm_client.complete_text(
+            ANALYSIS_SYSTEM_PROMPT, _analysis_prompt(resume_text, job_description, focus_notes), temperature=0.15,
+        )
         return self._to_analysis(report_markdown)
+
+    async def stream_analysis(
+        self,
+        resume_text: str,
+        job_description: str,
+        focus_notes: str = "",
+    ) -> AsyncIterator[Any]:
+        """Stream detailed analysis. Yields text chunks, final yield is AnalysisResult."""
+        full_text = ""
+        async for chunk in self.llm_client.stream_text(
+            ANALYSIS_SYSTEM_PROMPT, _analysis_prompt(resume_text, job_description, focus_notes), temperature=0.15,
+        ):
+            full_text += chunk
+            yield chunk
+        yield self._to_analysis(full_text)
 
     async def optimize(
         self,
@@ -128,15 +199,11 @@ class ResumeOptimizerAgent:
         return self._to_optimization(payload)
 
     def _to_analysis(self, report_markdown: str) -> AnalysisResult:
-        report = report_markdown.strip() or "# 📊 简历与JD匹配度诊断报告\n\n模型未返回分析内容。"
-        match = re.search(r"综合匹配度评分[:：]\s*\[?(\d{1,3})\]?\s*%", report)
-        score = int(match.group(1)) if match else 0
-        score = max(0, min(100, score))
-        summary = _extract_section_first_paragraph(report, "## 🎯 综合匹配度评分")
+        report = report_markdown.strip() or "# 📊 详细匹配分析\n\n模型未返回分析内容。"
         return AnalysisResult(
             report_markdown=report,
-            match_score=score,
-            match_summary=summary,
+            match_score=0,
+            match_summary="",
         )
 
     def _to_optimization(self, payload: dict[str, Any]) -> OptimizationResult:
@@ -147,23 +214,6 @@ class ResumeOptimizerAgent:
             optimized_resume_md=optimized_resume,
             change_log=normalize_bullets(_as_list(payload.get("change_log"))),
         )
-
-
-def _extract_section_first_paragraph(report_markdown: str, marker: str) -> str:
-    if marker not in report_markdown:
-        return ""
-    after = report_markdown.split(marker, 1)[1].strip()
-    lines = []
-    for line in after.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if lines:
-                break
-            continue
-        if stripped.startswith("## "):
-            break
-        lines.append(stripped)
-    return " ".join(lines).strip()
 
 
 def _as_list(value: Any) -> list[str]:

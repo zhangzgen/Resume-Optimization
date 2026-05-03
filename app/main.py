@@ -15,6 +15,7 @@ from app.config import settings
 from app.exporters import build_markdown_export, build_text_export
 from app.file_handlers import ResumeFileError, extract_resume_text
 from app.llm import LLMConfigError, LLMResponseError
+from app.models import AnalysisResult
 from app.storage import InMemorySessionStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -71,41 +72,11 @@ def _chunk_text(text: str, size: int = 110) -> list[str]:
     return chunks
 
 
-def _build_input_summary(
-    *,
-    resume_text: str,
-    job_description: str,
-    focus_notes: str,
-    source_label: str,
-) -> str:
-    focus_label = focus_notes if focus_notes else "未补充额外偏好"
-    parts = [
-        "### 已接收输入",
-        f"- 简历来源：{source_label}",
-        f"- 简历长度：约 {len(resume_text)} 字",
-        f"- JD 长度：约 {len(job_description)} 字",
-        f"- 补充信息：{focus_label}",
-        "",
-        "### 本次任务",
-        "- 输出岗位匹配分析",
-        "- 生成一份可下载的优化后简历",
-    ]
-    return "\n".join(parts).strip()
-
-
-def _build_analysis_report(report_markdown: str, session_id: str) -> str:
-    report = (report_markdown or "").strip()
-    if not report:
-        report = "# 📊 简历与JD匹配度诊断报告\n\n模型未返回分析内容。"
-    return "\n".join([report, "", f"`会话 ID: {session_id[:8]}`"]).strip()
-
-
 def _build_completion_markdown(session_id: str) -> str:
     parts = [
         "### 输出完成",
         "- 优化后的简历已经生成",
-        "- 右侧结果栏已启用 `Markdown 下载` 按钮",
-        f"- 可继续保留本轮会话编号：`{session_id[:8]}`",
+        f"- 会话编号：`{session_id[:8]}`",
     ]
     return "\n".join(parts).strip()
 
@@ -130,18 +101,21 @@ async def optimize_compat() -> RedirectResponse:
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/api/optimize-stream")
-async def optimize_stream(
+@app.post("/api/analyze-stream")
+async def analyze_stream(
     resume_text: str = Form(""),
     job_description: str = Form(...),
     focus_notes: str = Form(""),
     resume_file: Optional[UploadFile] = File(None),
 ) -> StreamingResponse:
+    """Phase 1: Quick match score."""
     try:
         uploaded_resume_text, source_filename = await extract_resume_text(resume_file)
     except ResumeFileError as exc:
+        error_msg = str(exc)
+
         async def failed_upload() -> AsyncIterator[str]:
-            yield _sse_event("error", {"message": str(exc)})
+            yield _sse_event("error", {"message": error_msg})
 
         return StreamingResponse(failed_upload(), media_type="text/event-stream")
 
@@ -163,7 +137,6 @@ async def optimize_stream(
     session = store.create(final_resume_text, final_jd, source_filename=source_filename)
     session.focus_notes = final_focus_notes
     store.save(session)
-    resume_source_label = f"上传文件 `{source_filename}`" if not (resume_text or "").strip() and source_filename else "粘贴简历文本"
 
     async def event_stream() -> AsyncIterator[str]:
         yield _sse_event(
@@ -174,42 +147,76 @@ async def optimize_stream(
                 "llm_ready": settings.is_llm_configured,
             },
         )
-        yield _sse_event("status", {"label": "正在读取输入并初始化任务"})
-        yield _sse_event("stage_start", {"stage": "input_summary", "title": "任务输入"})
-        for chunk in _chunk_text(
-            _build_input_summary(
-                resume_text=final_resume_text,
-                job_description=final_jd,
-                focus_notes=final_focus_notes,
-                source_label=resume_source_label,
-            ),
-            size=120,
-        ):
-            yield _sse_event("stage_delta", {"stage": "input_summary", "delta_markdown": chunk})
-            await asyncio.sleep(0.015)
-        yield _sse_event("stage_done", {"stage": "input_summary"})
 
-        await asyncio.sleep(0.15)
-        yield _sse_event("status", {"label": "正在生成匹配诊断与优化建议"})
+        # --- Stage 1: Match score (non-streaming) ---
+        yield _sse_event("status", {"label": "正在计算匹配度"})
+        yield _sse_event("stage_start", {"stage": "match_score", "title": "匹配度评分"})
 
         try:
-            session.analysis = await agent.analyze(final_resume_text, final_jd, focus_notes=final_focus_notes)
+            score_json = await agent.score_only(final_resume_text, final_jd, focus_notes=final_focus_notes)
+        except (LLMConfigError, LLMResponseError, ValueError) as exc:
+            yield _sse_event("error", {"message": str(exc)})
+            return
+        except Exception as exc:
+            yield _sse_event("error", {"message": f"匹配度计算失败：{exc}"})
+            return
+
+        yield _sse_event("stage_done", {"stage": "match_score"})
+        yield _sse_event("score_ready", {
+            "session_id": session.session_id,
+            "score": (score_json or {}).get("score", 0),
+            "summary": (score_json or {}).get("summary", ""),
+        })
+        yield _sse_event("status", {"label": "匹配度已出，请点击开始分析"})
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
+
+@app.post("/api/detail-stream")
+async def detail_stream(
+    session_id: str = Form(...),
+) -> StreamingResponse:
+    """Phase 2: Detailed analysis + optimization, triggered by user click."""
+    session = store.get(session_id)
+    if session is None:
+        async def not_found() -> AsyncIterator[str]:
+            yield _sse_event("error", {"message": "会话不存在或已过期，请重新开始。"})
+
+        return StreamingResponse(not_found(), media_type="text/event-stream")
+
+    async def event_stream() -> AsyncIterator[str]:
+        # --- Stage 3: Detailed analysis (streaming) ---
+        yield _sse_event("status", {"label": "正在生成详细分析"})
+        yield _sse_event("detail_start", {})
+        yield _sse_event("stage_start", {"stage": "detail_analysis", "title": "详细匹配分析"})
+
+        try:
+            analysis_result = None
+            async for item in agent.stream_analysis(session.original_resume, session.job_description, focus_notes=session.focus_notes):
+                if isinstance(item, AnalysisResult):
+                    analysis_result = item
+                else:
+                    yield _sse_event("stage_delta", {"stage": "detail_analysis", "delta_markdown": item})
+            session.analysis = analysis_result
             store.save(session)
         except (LLMConfigError, LLMResponseError, ValueError) as exc:
             yield _sse_event("error", {"message": str(exc)})
             return
-        except Exception as exc:  # pragma: no cover - defensive fallback
+        except Exception as exc:
             yield _sse_event("error", {"message": f"分析请求失败：{exc}"})
             return
 
-        yield _sse_event("stage_start", {"stage": "match_analysis", "title": "匹配诊断与优化建议"})
-        analysis_text = _build_analysis_report(session.analysis.report_markdown, session.session_id)
-        for chunk in _chunk_text(analysis_text):
-            yield _sse_event("stage_delta", {"stage": "match_analysis", "delta_markdown": chunk})
-            await asyncio.sleep(0.02)
-        yield _sse_event("stage_done", {"stage": "match_analysis"})
+        yield _sse_event("stage_done", {"stage": "detail_analysis"})
 
-        yield _sse_event("status", {"label": "正在生成优化后的简历文件"})
+        # --- Stage 4: Optimization ---
+        await asyncio.sleep(0.15)
+        yield _sse_event("status", {"label": "正在生成优化后的简历"})
+
         try:
             session.optimized = await agent.optimize(
                 session.original_resume,
@@ -221,7 +228,7 @@ async def optimize_stream(
         except (LLMConfigError, LLMResponseError, ValueError) as exc:
             yield _sse_event("error", {"message": str(exc)})
             return
-        except Exception as exc:  # pragma: no cover - defensive fallback
+        except Exception as exc:
             yield _sse_event("error", {"message": f"优化请求失败：{exc}"})
             return
 
@@ -238,7 +245,7 @@ async def optimize_stream(
                 "download_url": f"/export/{session.session_id}/md",
             },
         )
-        yield _sse_event("status", {"label": "优化完成，可在右侧下载 Markdown"})
+        yield _sse_event("status", {"label": "全部完成"})
 
     headers = {
         "Cache-Control": "no-cache",

@@ -1,7 +1,7 @@
 [project]
 name = "resume-optimizer-agent"
-version = "0.1.0"
-description = "A Docker-ready resume optimizer agent built with FastAPI and DeepSeek."
+version = "0.2.0"
+description = "A Docker-ready resume optimizer agent built with FastAPI and Xiaomi MiMo."
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
